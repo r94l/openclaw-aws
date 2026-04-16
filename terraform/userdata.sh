@@ -61,7 +61,4 @@ sudo usermod -aG docker ${ USER }
 
 newgrp docker
 
-# Install tailscale and connect to private network 
-curl -fsSL https://tailscale.com/install.sh | sh
-
 echo "Userdata script completed successfully"
