@@ -1,0 +1,224 @@
+#cloud-config
+# OpenClaw on Azure — Hardened Ubuntu 22.04 Setup
+# This script runs once at first boot. All steps are idempotent.
+# Monitor progress: sudo tail -f /var/log/cloud-init-output.log
+
+# ──────────────────────────────────────────────
+# System packages
+# ──────────────────────────────────────────────
+package_update: true
+package_upgrade: true
+package_reboot_if_required: false
+
+packages:
+  - ufw
+  - fail2ban
+  - unattended-upgrades
+  - curl
+  - ca-certificates
+  - gnupg
+  - apt-transport-https
+  - jq
+  - htop
+  - git
+  - logrotate
+
+# ──────────────────────────────────────────────
+# Write config files before runcmd executes
+# ──────────────────────────────────────────────
+write_files:
+
+  # ── sshd hardening ──────────────────────────
+  - path: /etc/ssh/sshd_config.d/99-hardening.conf
+    owner: root:root
+    permissions: "0644"
+    content: |
+      Port ${ssh_port}
+      PermitRootLogin no
+      PasswordAuthentication no
+      PubkeyAuthentication yes
+      AuthorizedKeysFile .ssh/authorized_keys
+      X11Forwarding no
+      AllowTcpForwarding no
+      MaxAuthTries 3
+      LoginGraceTime 20
+      ClientAliveInterval 300
+      ClientAliveCountMax 2
+      # Only allow our admin user
+      AllowUsers ${admin_username}
+
+  # ── fail2ban SSH jail ────────────────────────
+  - path: /etc/fail2ban/jail.d/sshd.conf
+    owner: root:root
+    permissions: "0644"
+    content: |
+      [sshd]
+      enabled  = true
+      port     = ${ssh_port}
+      filter   = sshd
+      logpath  = /var/log/auth.log
+      maxretry = 3
+      bantime  = 3600
+      findtime = 600
+
+  # ── unattended-upgrades (security patches only) ─
+  - path: /etc/apt/apt.conf.d/50unattended-upgrades
+    owner: root:root
+    permissions: "0644"
+    content: |
+      Unattended-Upgrade::Allowed-Origins {
+          "${distro_id}:${distro_codename}-security";
+      };
+      Unattended-Upgrade::AutoFixInterruptedDpkg "true";
+      Unattended-Upgrade::MinimalSteps "true";
+      Unattended-Upgrade::Remove-Unused-Packages "true";
+      Unattended-Upgrade::Automatic-Reboot "false";
+
+  # ── Docker Compose for OpenClaw ──────────────
+  - path: /home/${admin_username}/openclaw/docker-compose.yml
+    owner: ${admin_username}:${admin_username}
+    permissions: "0640"
+    content: |
+      version: "3.8"
+      services:
+        openclaw:
+          image: ghcr.io/steipete/clawdbot:${openclaw_version}
+          container_name: openclaw
+          restart: unless-stopped
+          env_file:
+            - .env
+          volumes:
+            - ./memory:/app/memory
+            - ./config:/app/config
+          # Port is only bound to localhost — Tailscale handles access
+          ports:
+            - "127.0.0.1:18789:18789"
+          logging:
+            driver: "json-file"
+            options:
+              max-size: "10m"
+              max-file: "3"
+
+  # ── OpenClaw env template (fill in your API keys) ─
+  - path: /home/${admin_username}/openclaw/.env.template
+    owner: ${admin_username}:${admin_username}
+    permissions: "0600"
+    content: |
+      # Copy this to .env and fill in your values
+      # cp .env.template .env && nano .env
+
+      # ── AI Provider (at least one required) ──
+      ANTHROPIC_API_KEY=your_anthropic_key_here
+      # OPENAI_API_KEY=your_openai_key_here      # optional backup
+
+      # ── Messaging integrations (add as needed) ─
+      # TELEGRAM_BOT_TOKEN=
+      # DISCORD_BOT_TOKEN=
+      # SLACK_BOT_TOKEN=
+
+      # ── Security ─────────────────────────────
+      # Set a strong random token for the gateway
+      GATEWAY_TOKEN=change_this_to_a_random_string
+
+      # Enable sandbox to restrict shell command execution
+      SANDBOX_MODE=true
+
+  # ── Memory backup cron ───────────────────────
+  - path: /etc/cron.daily/openclaw-backup
+    owner: root:root
+    permissions: "0755"
+    content: |
+      #!/bin/bash
+      # Daily backup of OpenClaw memory to /var/backups/openclaw
+      # Keeps last 7 days of backups
+      BACKUP_DIR="/var/backups/openclaw"
+      SOURCE_DIR="/home/${admin_username}/openclaw/memory"
+      DATE=$(date +%F)
+
+      mkdir -p "$BACKUP_DIR"
+      tar -czf "$BACKUP_DIR/memory_$DATE.tar.gz" "$SOURCE_DIR" 2>/dev/null
+
+      # Prune backups older than 7 days
+      find "$BACKUP_DIR" -name "*.tar.gz" -mtime +7 -delete
+
+  # ── UFW rules script ─────────────────────────
+  - path: /root/setup-ufw.sh
+    owner: root:root
+    permissions: "0700"
+    content: |
+      #!/bin/bash
+      ufw --force reset
+      ufw default deny incoming
+      ufw default allow outgoing
+      # Only allow our custom SSH port
+      ufw allow ${ssh_port}/tcp comment "SSH non-standard"
+      ufw --force enable
+      ufw status verbose
+
+# ──────────────────────────────────────────────
+# Execution steps
+# ──────────────────────────────────────────────
+runcmd:
+
+  # ── 1. Disable ssh.socket (Ubuntu 22+ systemd gotcha) ──
+  - systemctl stop ssh.socket || true
+  - systemctl disable ssh.socket || true
+
+  # ── 2. Reload sshd on new port ──────────────
+  - systemctl restart ssh
+
+  # ── 3. Configure UFW firewall ───────────────
+  - /root/setup-ufw.sh
+
+  # ── 4. Start fail2ban ────────────────────────
+  - systemctl enable fail2ban
+  - systemctl start fail2ban
+
+  # ── 5. Enable automatic security updates ────
+  - systemctl enable unattended-upgrades
+  - systemctl start unattended-upgrades
+
+  # ── 6. Install Docker (official repo) ───────
+  - install -m 0755 -d /etc/apt/keyrings
+  - curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+  - chmod a+r /etc/apt/keyrings/docker.asc
+  - |
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] \
+    https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" \
+    > /etc/apt/sources.list.d/docker.list
+  - apt-get update -qq
+  - apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
+  # Add admin user to docker group (no sudo needed for docker commands)
+  - usermod -aG docker ${admin_username}
+
+  # Enable Docker on boot
+  - systemctl enable docker
+  - systemctl start docker
+
+  # ── 7. Install Tailscale ─────────────────────
+  - curl -fsSL https://tailscale.com/install.sh | sh
+  - systemctl enable tailscaled
+  - systemctl start tailscaled
+
+  # Authenticate with Tailscale (--ssh enables Tailscale SSH as fallback)
+  - tailscale up --authkey="${tailscale_authkey}" --ssh --hostname="openclaw-azure" --accept-dns=true
+
+  # ── 8. Set up OpenClaw directory ─────────────
+  - mkdir -p /home/${admin_username}/openclaw/{memory,config}
+  - chown -R ${admin_username}:${admin_username} /home/${admin_username}/openclaw
+
+  # ── 9. Pull OpenClaw image (so first start is fast) ─
+  - docker pull ghcr.io/steipete/clawdbot:${openclaw_version} || true
+
+  # ── 10. Log completion ───────────────────────
+  - echo "=== cloud-init complete $(date) ===" >> /var/log/openclaw-setup.log
+  - echo "Next step: SSH in, copy .env.template to .env, fill in API keys, then run: cd ~/openclaw && docker compose up -d" >> /var/log/openclaw-setup.log
+
+# ──────────────────────────────────────────────
+# Final message visible in cloud-init logs
+# ──────────────────────────────────────────────
+final_message: |
+  OpenClaw Azure setup complete.
+  SSH: ssh -p ${ssh_port} -i openclaw.pem ${admin_username}@<public-ip>
+  Then: cd ~/openclaw && cp .env.template .env && nano .env && docker compose up -d
