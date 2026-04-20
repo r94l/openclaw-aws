@@ -1,78 +1,189 @@
-# Openclaw-Azure
+# OpenClaw on Azure — Terraform + Hardened VM
 
-Deploy OpenClaw (Moltbot/Clawdbot) as a 24/7 AI agent on Azure VM using Docker and Tailscale: hardened, containerized and privately accessible with zero public ports exposed.
+Deploy a hardened, 24/7 OpenClaw AI agent on Azure using Terraform and cloud-init.
+Zero manual server steps. Port 22 is never opened.
 
-Based on this guide: [Deploy Your Own 24/7 AI Agent on AWS EC2 with Docker & Tailscale](https://medium.com/thecloudopscommunity/deploy-your-own-24-7-ai-agent-on-aws-ec2-with-docker-tailscale-the-secure-way-e8e3dadde6a4)
+## Architecture
 
-## What You Get
+```
+Your Machine (Tailscale) ──► Azure VM (Tailscale)
+                                 └── Docker: OpenClaw (port 18789, localhost only)
+                                 └── UFW: only port 2222 open publicly
+                                 └── fail2ban + unattended-upgrades
+```
 
-- Ubuntu 24.04 VM instance provisioned via Terraform.
-- Hardened SSH on port 2222 (non-default)
-- OpenClaw running in an isolated Docker container
-- Secure private access via Tailscale — no inbound ports exposed beyond SSH
-- Encrypted EBS root volume (gp3, 15GB)
+After confirming Tailscale works, port 2222 is removed from the NSG and the VM
+has **zero public ports** — all access flows through the encrypted Tailscale network.
+
+---
 
 ## Prerequisites
 
-- Azure account with credentials configured
-- Terraform >= 1.0 installed ([install guide](https://developer.hashicorp.com/terraform/install))
-- A [Tailscale](https://tailscale.com) account + auth key
+- [Terraform >= 1.5](https://developer.hashicorp.com/terraform/install)
+- [Azure CLI](https://learn.microsoft.com/en-us/cli/azure/install-azure-cli) — logged in (`az login`)
+- [Tailscale account](https://tailscale.com) — with an auth key ready
+- Your public IP: `curl ifconfig.me`
 
-## Project Structure
+---
 
-```
-.
-├── terraform/
-│   ├── main.tf          # EC2 instance, security group, IAM role & profile
-│   ├── variables.tf     # Input variable declarations
-│   ├── outputs.tf       # Output values (e.g. instance IP)
-│   ├── terraform.tfvars # Your variable values (gitignored)
-│   └── userdata.sh      # Bootstrap script — runs automatically on first boot
-└── README.md
-```
+## Quick Start
 
-## Variables
-
-Create a `terraform.tfvars` file inside the `terraform/` directory:
-
-```hcl
-project_name  = "openclaw"
-environment   = "dev"
-aws_region    = "us-east-1"
-ami_id        = "ami-xxxxxxxxxxxxxxxxx"  # Ubuntu 24.04 LTS
-instance_type = "t3.medium"
-key_pair_name = "your-key-pair-name"
-vpc_id        = "vpc-xxxxxxxxxxxxxxxxx"
-subnet_id     = "subnet-xxxxxxxxxxxxxxxxx"
-```
-
-## Deployment
+### 1. Clone and configure
 
 ```bash
-git clone https://github.com/r94l/openclaw-aws.git
-cd openclaw-aws/terraform
-
 cp terraform.tfvars.example terraform.tfvars
-# fill in your values
+nano terraform.tfvars
+```
 
+Fill in:
+- `allowed_ssh_cidr` — your IP (from `curl ifconfig.me`) + `/32`
+- `tailscale_authkey` — from https://login.tailscale.com/admin/settings/keys
+
+Or pass the Tailscale key as an env var (more secure):
+```bash
+export TF_VAR_tailscale_authkey="tskey-auth-xxxx"
+```
+
+### 2. Deploy
+
+```bash
 terraform init
-terraform plan
+terraform plan     # review what will be created
 terraform apply
 ```
 
-On first boot, `userdata.sh` runs automatically as EC2 User Data and handles the full Phase 1 setup — package updates, Docker installation, SSH hardening, and Tailscale onboarding.
+Terraform will output your public IP and a ready-to-run SSH command.
 
-Once the instance is up, connect via Tailscale and follow Phase 2 of the guide to deploy the OpenClaw container.
+### 3. Wait for cloud-init (~3–5 minutes)
 
-## Security Notes
+After `terraform apply` completes, the VM is booting and running cloud-init.
+This installs Docker, Tailscale, and OpenClaw. Don't SSH in yet — wait ~5 minutes.
 
-- SSH is exposed on port **2222** only — restrict the `cidr_blocks` in `main.tf` to your IP in production
-- All access beyond SSH is routed through Tailscale's encrypted private network
-- Root EBS volume is encrypted at rest
-- IAM role is scoped to ECR read-only and Secrets Manager
+To check progress once you're in:
+```bash
+sudo tail -f /var/log/cloud-init-output.log
+```
 
-## Teardown
+### 4. SSH in and configure OpenClaw
+
+```bash
+# The SSH command is shown in terraform output
+ssh -p 2222 -i ./openclaw.pem openclaw@<PUBLIC_IP>
+
+# Once inside:
+cd ~/openclaw
+cp .env.template .env
+nano .env          # add your ANTHROPIC_API_KEY and GATEWAY_TOKEN
+docker compose up -d
+docker compose logs -f   # watch startup
+```
+
+### 5. Access OpenClaw via Tailscale
+
+```bash
+# On the VM, get the Tailscale IP
+sudo tailscale ip -4
+```
+
+On your local machine (also connected to Tailscale):
+```
+http://<tailscale-ip>:18789
+```
+
+Use the GATEWAY_TOKEN you set in .env to log in.
+
+### 6. Lock down (remove public SSH port)
+
+Once OpenClaw is running and accessible via Tailscale:
+
+In `main.tf`, delete or comment out the `ssh_inbound` security rule block, then:
+
+```bash
+terraform apply
+```
+
+Port 2222 is now closed. The VM has zero public ports.
+SSH going forward: `tailscale ssh openclaw@openclaw-azure`
+
+---
+
+## Day 2 Operations
+
+### Updating OpenClaw
+
+```bash
+cd ~/openclaw
+docker compose pull
+docker compose up -d
+```
+
+### Viewing logs
+
+```bash
+docker compose logs -f openclaw
+```
+
+### Checking memory backups
+
+```bash
+ls -lh /var/backups/openclaw/
+```
+
+### Resizing the VM
+
+In `terraform.tfvars`, change `vm_size` to a larger SKU, then:
+```bash
+terraform apply
+```
+The VM will be deallocated and resized. OpenClaw will restart automatically
+(Docker restart policy is `unless-stopped`).
+
+### Destroying everything
 
 ```bash
 terraform destroy
+```
+
+All Azure resources are deleted. Your `.pem` key and `terraform.tfstate` remain locally.
+
+---
+
+## Security Hardening Summary
+
+| Layer | What's done |
+|---|---|
+| SSH | Non-standard port (2222), key-only auth, root login disabled, fail2ban |
+| Firewall | UFW default deny inbound, only 2222 open (removed after Tailscale confirmed) |
+| OS | Unattended security updates, no password auth |
+| Docker | Port 18789 bound to localhost only — never publicly exposed |
+| Network | Azure NSG denies all inbound except 2222 |
+| Access | All post-setup access via Tailscale encrypted tunnel |
+
+---
+
+## Cost Estimate (Azure)
+
+| Resource | ~Monthly Cost |
+|---|---|
+| Standard_B2s VM | ~$30 |
+| Standard SSD (30 GB) | ~$3 |
+| Public IP (Static) | ~$4 |
+| Bandwidth (egress) | ~$1–5 |
+| **Total** | **~$38–42/mo** |
+
+Upgrade to `Standard_D2s_v3` (~$70/mo) for better CPU/memory performance.
+
+---
+
+## File Structure
+
+```
+openclaw-azure/
+├── main.tf                    # Core infrastructure
+├── variables.tf               # All input variables with descriptions
+├── outputs.tf                 # SSH command, IP, next steps
+├── terraform.tfvars.example   # Template — copy to terraform.tfvars
+├── .gitignore                 # Keeps secrets out of git
+└── scripts/
+    └── cloud-init.yaml        # Full VM setup script (runs at first boot)
 ```
