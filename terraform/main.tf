@@ -1,109 +1,211 @@
 terraform {
+  required_version = ">= 1.5.0"
+
   required_providers {
-    aws = {
-      source  = "hashicorp/aws"
-      version = "~> 5.0"
+    azurerm = {
+      source  = "hashicorp/azurerm"
+      version = "~> 3.100"
+    }
+    tls = {
+      source  = "hashicorp/tls"
+      version = "~> 4.0"
     }
   }
 
-  required_version = ">= 1.0"
+  # Uncomment to use remote state (recommended for real deployments)
+  # backend "azurerm" {
+  #   resource_group_name  = "tfstate-rg"
+  #   storage_account_name = "tfstateXXXXXX"
+  #   container_name       = "tfstate"
+  #   key                  = "openclaw.tfstate"
+  # }
 }
 
-provider "aws" {
-  region = var.aws_region
-}
-
-# IAM Role for EC2
-resource "aws_iam_role" "ec2_role" {
-  name = "${var.project_name}-ec2-role"
-
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Action = "sts:AssumeRole"
-        Effect = "Allow"
-        Principal = {
-          Service = "ec2.amazonaws.com"
-        }
-      }
-    ]
-  })
-
-  tags = {
-    Name        = "${var.project_name}-ec2-role"
-    Environment = var.environment
+provider "azurerm" {
+  features {
+    virtual_machine {
+      # Ensures OS disk is deleted when VM is destroyed
+      delete_os_disk_on_deletion = true
+    }
   }
 }
 
-# Create instance profile for EC2
-resource "aws_iam_instance_profile" "ec2_profile" {
-  name = "${var.project_name}-ec2-profile"
-  role = aws_iam_role.ec2_role.name
+# ──────────────────────────────────────────────
+# Resource Group
+# ──────────────────────────────────────────────
+resource "azurerm_resource_group" "openclaw" {
+  name     = "${var.prefix}-rg"
+  location = var.location
+
+  tags = local.common_tags
 }
 
-# Security Group
-# ─────────────────────────────────────────
-resource "aws_security_group" "clawdthebutler_sg" {
-  name        = "${var.project_name}-sg"
-  vpc_id      = var.vpc_id
-  description = "Security group for clawdthebutler application"
+# ──────────────────────────────────────────────
+# Networking
+# ──────────────────────────────────────────────
+resource "azurerm_virtual_network" "openclaw" {
+  name                = "${var.prefix}-vnet"
+  resource_group_name = azurerm_resource_group.openclaw.name
+  location            = azurerm_resource_group.openclaw.location
+  address_space       = ["10.0.0.0/16"]
 
-  # SSH - only from your IP
-  ingress {
-    description = "SSH"
-    from_port   = 2222
-    to_port     = 2222
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"] # Restrict to your IP in production
-  }
-
-   # SSH - only from your IP
-  ingress {
-    description = "SSH"
-    from_port   = 22
-    to_port     = 22
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"] # Restrict to your IP in production
-
-
-  # Allow all outbound traffic
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  tags = {
-    Name        = "${var.project_name}-sg"
-    Environment = var.environment
-  }
-
+  tags = local.common_tags
 }
 
-# EC2 Instance
-# ─────────────────────────────────────────
-resource "aws_instance" "clawdthebutler" {
-  ami                    = var.ami_id
-  instance_type          = var.instance_type
-  key_name               = var.key_pair_name
-  vpc_security_group_ids = [aws_security_group.clawdthebutler_sg.id]
-  subnet_id              = var.subnet_id
-  iam_instance_profile   = aws_iam_instance_profile.ec2_profile.name
+resource "azurerm_subnet" "openclaw" {
+  name                 = "${var.prefix}-subnet"
+  resource_group_name  = azurerm_resource_group.openclaw.name
+  virtual_network_name = azurerm_virtual_network.openclaw.name
+  address_prefixes     = ["10.0.1.0/24"]
+}
 
-  root_block_device {
-    volume_size = 20
-    volume_type = "gp3"
-    encrypted   = true
+resource "azurerm_public_ip" "openclaw" {
+  name                = "${var.prefix}-pip"
+  resource_group_name = azurerm_resource_group.openclaw.name
+  location            = azurerm_resource_group.openclaw.location
+  allocation_method   = "Static"
+  sku                 = "Standard"
+
+  tags = local.common_tags
+}
+
+# ──────────────────────────────────────────────
+# Network Security Group
+# Only port 2222 (SSH) is opened publicly.
+# Port 22 is intentionally never opened.
+# Once Tailscale is confirmed working, remove
+# the ssh_inbound rule and apply again to go
+# fully dark (zero public ports).
+# ──────────────────────────────────────────────
+resource "azurerm_network_security_group" "openclaw" {
+  name                = "${var.prefix}-nsg"
+  resource_group_name = azurerm_resource_group.openclaw.name
+  location            = azurerm_resource_group.openclaw.location
+
+  # SSH on non-standard port — restrict to your IP
+  security_rule {
+    name                       = "ssh_inbound"
+    priority                   = 100
+    direction                  = "Inbound"
+    access                     = "Allow"
+    protocol                   = "Tcp"
+    source_port_range          = "*"
+    destination_port_range     = tostring(var.ssh_port)
+    source_address_prefix      = var.allowed_ssh_cidr
+    destination_address_prefix = "*"
   }
 
-  # User data script runs on first boot
-  user_data = file("${path.module}/userdata.sh")
+  # Deny everything else inbound (explicit default)
+  security_rule {
+    name                       = "deny_all_inbound"
+    priority                   = 4096
+    direction                  = "Inbound"
+    access                     = "Deny"
+    protocol                   = "*"
+    source_port_range          = "*"
+    destination_port_range     = "*"
+    source_address_prefix      = "*"
+    destination_address_prefix = "*"
+  }
 
-  tags = {
-    Name        = "${var.project_name}-server"
-    Environment = var.environment
-    Project     = var.project_name
+  tags = local.common_tags
+}
+
+resource "azurerm_subnet_network_security_group_association" "openclaw" {
+  subnet_id                 = azurerm_subnet.openclaw.id
+  network_security_group_id = azurerm_network_security_group.openclaw.id
+}
+
+# ──────────────────────────────────────────────
+# SSH Key Pair
+# Terraform generates the key; private key is
+# saved locally as openclaw.pem
+# ──────────────────────────────────────────────
+resource "tls_private_key" "openclaw" {
+  algorithm = "RSA"
+  rsa_bits  = 4096
+}
+
+resource "local_sensitive_file" "private_key" {
+  content         = tls_private_key.openclaw.private_key_pem
+  filename        = "${path.module}/openclaw.pem"
+  file_permission = "0600"
+}
+
+# ──────────────────────────────────────────────
+# Network Interface
+# ──────────────────────────────────────────────
+resource "azurerm_network_interface" "openclaw" {
+  name                = "${var.prefix}-nic"
+  resource_group_name = azurerm_resource_group.openclaw.name
+  location            = azurerm_resource_group.openclaw.location
+
+  ip_configuration {
+    name                          = "internal"
+    subnet_id                     = azurerm_subnet.openclaw.id
+    private_ip_address_allocation = "Dynamic"
+    public_ip_address_id          = azurerm_public_ip.openclaw.id
+  }
+
+  tags = local.common_tags
+}
+
+resource "azurerm_network_interface_security_group_association" "openclaw" {
+  network_interface_id      = azurerm_network_interface.openclaw.id
+  network_security_group_id = azurerm_network_security_group.openclaw.id
+}
+
+# ──────────────────────────────────────────────
+# Virtual Machine
+# ──────────────────────────────────────────────
+resource "azurerm_linux_virtual_machine" "openclaw" {
+  name                  = "${var.prefix}-vm"
+  resource_group_name   = azurerm_resource_group.openclaw.name
+  location              = azurerm_resource_group.openclaw.location
+  size                  = var.vm_size
+  admin_username        = var.admin_username
+  network_interface_ids = [azurerm_network_interface.openclaw.id]
+
+  # cloud-init runs at first boot — full setup, zero manual steps
+  custom_data = base64encode(templatefile("${path.module}/scripts/cloud-init.yaml", {
+    ssh_port          = var.ssh_port
+    admin_username    = var.admin_username
+    tailscale_authkey = var.tailscale_authkey
+    openclaw_version  = var.openclaw_version
+  }))
+
+  admin_ssh_key {
+    username   = var.admin_username
+    public_key = tls_private_key.openclaw.public_key_openssh
+  }
+
+  os_disk {
+    name                 = "${var.prefix}-osdisk"
+    caching              = "ReadWrite"
+    storage_account_type = "Premium_LRS"
+    disk_size_gb         = 30
+  }
+
+  source_image_reference {
+    publisher = "Canonical"
+    offer     = "0001-com-ubuntu-server-jammy"
+    sku       = "22_04-lts-gen2"
+    version   = "latest"
+  }
+
+  # Disable password authentication — key only
+  disable_password_authentication = true
+
+  tags = local.common_tags
+}
+
+# ──────────────────────────────────────────────
+# Locals
+# ──────────────────────────────────────────────
+locals {
+  common_tags = {
+    project     = "openclaw"
+    environment = var.environment
+    managed_by  = "terraform"
   }
 }
