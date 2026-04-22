@@ -166,14 +166,6 @@ resource "azurerm_linux_virtual_machine" "openclaw" {
   admin_username        = var.admin_username
   network_interface_ids = [azurerm_network_interface.openclaw.id]
 
-  # cloud-init runs at first boot — full setup, zero manual steps
-  custom_data = base64encode(templatefile("${path.module}/scripts/cloud-init.yaml", {
-    ssh_port          = var.ssh_port
-    admin_username    = var.admin_username
-    tailscale_authkey = var.tailscale_authkey
-    openclaw_version  = var.openclaw_version
-  }))
-
   admin_ssh_key {
     username   = var.admin_username
     public_key = tls_private_key.openclaw.public_key_openssh
