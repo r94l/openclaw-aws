@@ -1,4 +1,4 @@
-# 🦞 OpenClaw AI Agent on Azure — Terraform + Docker + Tailscale
+# 🦞 OpenClaw AI Agent on Azure: Terraform + Docker + Tailscale
 
 > Deploy a secure, 24/7 always-on AI agent on an Azure VM using Terraform for infrastructure provisioning, Docker for containerization, and Tailscale for zero-trust private networking.
 
@@ -147,9 +147,6 @@ Then go to NSG and delete the inbound rule for Port 22.
 ## 🐳 Step 3 — Install Docker and Docker Compose
 
 ```bash
-# Update system
-sudo apt update && sudo apt upgrade -y
-
 # Install dependencies
 sudo apt install -y apt-transport-https ca-certificates curl software-properties-common
 
@@ -170,10 +167,7 @@ sudo apt install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
 sudo systemctl enable docker
 sudo systemctl start docker
 
-# Add current user to docker group (so no sudo needed)
-sudo usermod -aG docker $USER
-
-# Add your user to the docker group (avoids needing sudo for every docker command)
+# Add openclaw user to docker group (so no sudo needed)
 sudo usermod -aG docker $USER
 
 # Apply the group change without logging out
@@ -209,9 +203,9 @@ Clone the official OpenClaw repository:
 git clone https://github.com/openclaw/openclaw.git
 cd openclaw
 # Create the folder structure 
-mkdir -p /home/openclaw/.openclaw/workspace 
+mkdir -p /~/openclaw/.openclaw/workspace 
 # Give full read/write access (fixes the "Permission Denied" error) 
-sudo chmod -R 777 /home/openclaw/.openclaw 
+sudo chmod -R 777 /~/openclaw/.openclaw 
 sudo chown -R openclaw:openclaw ~/openclaw 
 sudo chmod -R 775 ~/openclaw
 ```
