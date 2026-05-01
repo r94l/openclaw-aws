@@ -203,11 +203,12 @@ Clone the official OpenClaw repository:
 git clone https://github.com/openclaw/openclaw.git
 cd openclaw
 # Create the folder structure 
-mkdir -p /~/openclaw/.openclaw/workspace 
+mkdir -p /home/openclaw/.openclaw/workspace 
 # Give full read/write access (fixes the "Permission Denied" error) 
-sudo chmod -R 777 /~/openclaw/.openclaw 
+sudo chmod -R 777 /home/openclaw/.openclaw 
 sudo chown -R openclaw:openclaw ~/openclaw 
 sudo chmod -R 775 ~/openclaw
+
 ```
 
 Run the official setup script, which uses Docker Compose and walks you through initial configuration:
